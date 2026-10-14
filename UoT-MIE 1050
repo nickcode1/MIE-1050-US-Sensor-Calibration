@@ -1,3 +1,35 @@
+// =====================================================================================
+// UoT MIE1050 - CALIBRATED ULTRASONIC RANGE SENSOR (final firmware)
+// Based on the course firmware UoT-MIE1050 v1.2.0.
+// Every change from the original is marked with  // [CAL]
+//
+// Calibrated output (Range Sensor Calibration assignment):
+//   d_nominal = c(T, RH, P) * t / 2     c: speed of sound in humid air (Cramer 1993), t: median of 5 pings (us)
+//   d         = A*d_nominal + B         (linear, fitted to 40 calibration points, 200-2000 mm)
+//   The LCD shows the calibrated distance d. Validation RMS error: 3.2 mm (stock firmware: 17.8 mm).
+//   Linear model chosen over quadratic (validation RMS 2.1 mm): similar error, simpler model.
+//
+// What this version adds:
+//   1. Logs the RAW ultrasonic time of flight (microseconds) instead of only distance
+//   2. Keeps the BME680 gas heater ON (normal operating configuration, as calibrated)
+//   3. Prints one CSV line per sample over USB serial (115200 baud)
+//   4. Lets you label each block of samples with the reference (tape measure) distance
+//   5. Fixes integer division that truncated pressure (and gas resistance) to whole units
+//   6. Displays the calibrated distance: median of 5 pings, T/RH/P speed of sound, linear correction
+//
+// Serial commands (type into Serial Monitor or the Python logger, then press Enter):
+//   400        -> wait 3 s, then collect 30 samples labelled "400 mm", then double-beep
+//   w          -> warm-up mode: log continuously (target = -1) to watch temperature settle
+//   s          -> stop logging
+//   r up1      -> set the run label to "up1" (use: up1, down1, up2, down2, val ...)
+//   h          -> reprint the CSV header line
+//
+// CSV columns:
+//   time_ms, run, target_mm, n, tof_us, stock_mm, T_C, RH_pct, P_kPa
+//   tof_us   = raw round-trip echo time from the sensor (negative = no echo / error)
+//   stock_mm = distance using the chip's fixed constant: tof * 343500 mm/s / 2
+// =====================================================================================
+
 #include <SPI.h>                              // SPI library
 #include <Adafruit_Sensor.h>                  // Core sensor library
 #include <Adafruit_ST7789.h>                  // Hardware-specific library for ST7789
@@ -22,6 +54,18 @@
 //Other Constants
 #define BME_Addr 0x76
 #define SEALEVELPRESSURE_HPA (1013.25)
+
+// [CAL] Calibration logging settings
+#define SAMPLES_PER_POINT 30          // samples collected per typed distance
+#define SETTLE_MS 3000                // wait after a command so you can step away from the beam
+#define STOCK_SOS_MM_PER_US 0.3435    // 343500 mm/s, the fixed speed of sound given in the assignment
+// [CAL] Calibration parameters - LINEAR fit (Summary sheet of calibration_analysis)
+#define CAL_A  (1.0084)              // gain (-)
+#define CAL_B  (9.33622)               // offset (mm)
+#define N_PINGS 5                     // pings per reading; median rejects 25 us carrier cycle-skips
+#define PING_GAP_MS 30                // let echoes die out between pings
+#define CO2_FRACTION 0.0004           // ambient CO2 mole fraction used in the speed-of-sound model
+#define VERBOSE_PRINT 0               // 1 = also print the original multi-line sensor dump (clutters the CSV)
 
 //Location in memory to store SPI object and display object
 //The SPI object is used by the display class to send data to display
@@ -61,6 +105,9 @@ struct SensorResults {
   float vAIN;
   //Ultrasonic Sensor Pulse TTR
   float USDistance;
+  long TofUs;  // [CAL] raw round-trip time of flight in microseconds (median of N_PINGS)
+  float SoundSpeed;  // [CAL] speed of sound from T, RH, P (m/s)
+  float DistCal;     // [CAL] calibrated distance (mm)
 };
 
 // Boolean Variable to Check if AHT20 Sensor is Connected
@@ -69,10 +116,19 @@ bool AHTconnected;
 //Declare Struct
 SensorResults SensorData;
 
+// [CAL] Logging state
+enum LogMode { LOG_IDLE, LOG_COLLECT, LOG_WARMUP };
+LogMode logMode = LOG_IDLE;
+float targetMm = -1;              // reference distance typed by the user
+int samplesTaken = 0;             // samples logged in the current block
+unsigned long collectStartMs = 0; // when the current block is allowed to start
+String runLabel = "run1";         // label for the current sweep (up1, down1, ...)
+String cmdBuf = "";               // characters received over serial, until Enter
+
 // the setup function runs once when you press reset or power the board
 void setup() {
   Serial.begin(115200);
-  Serial.println("Hello World!");
+  Serial.println("# Hello World!");  // [CAL] lines starting with # are comments, not data
 
   //Init Buzzer and LED GPIO
   digitalWrite(LED_PIN, LOW);  //Turn off before setting to output to prevent flickering at boot
@@ -87,7 +143,7 @@ void setup() {
   tft.setRotation(3);
 
   //Print text to console to indicate it got here in the code
-  Serial.println("Initialized");
+  Serial.println("# Initialized");
 
   //Create Boot Image
   tft.fillScreen(ST77XX_BLACK);
@@ -98,60 +154,72 @@ void setup() {
   delay(1000);
 
   //Init all sensors
-  Wire.begin(16, 15);   //I2C Bus #1 Init (For BME, BMA, and ADC)
+  Wire.begin(16, 15);  //I2C Bus #1 Init (For BME, BMA, and ADC)
 
   //Init BME680
   if (!bme.begin(BME_Addr)) {
-    Serial.println("Could not find a valid BME680 sensor, check wiring!");
+    Serial.println("# Could not find a valid BME680 sensor, check wiring!");
   }
 
   //Init AHT20
   if (!aht.begin()) {
-    Serial.println("Could not find a valid AHT20 sensor, check wiring!");
+    Serial.println("# AHT20 not found - using BME680 for temperature and humidity");
     AHTconnected = false;
   } else {
     AHTconnected = true;
   }
 
-  // Set up oversampling and filter for BME680 - sensor no longer in use
+  // Set up oversampling and filter for BME680
   bme.setTemperatureOversampling(BME680_OS_8X);
   bme.setHumidityOversampling(BME680_OS_2X);
   bme.setPressureOversampling(BME680_OS_4X);
   bme.setIIRFilterSize(BME680_FILTER_SIZE_3);
-  bme.setGasHeater(320, 150);  // 320*C for 150 ms
+  bme.setGasHeater(320, 150);     // ORIGINAL: 320*C for 150 ms (kept on)
+  // bme.setGasHeater(0, 0);      // [CAL] option: heater off. Kept ON to calibrate in the normal operating configuration
 
   //Init ADC (ADS1015)
   if (!ads.begin()) {
-    Serial.println("Failed to initialize ADS.");
+    Serial.println("# Failed to initialize ADS.");
   }
 
   //Init BMA400
   if (accelerometer.beginI2C(BMA400_I2C_ADDRESS_DEFAULT) != BMA400_OK) {
-    Serial.println("Error: BMA400 not connected, check wiring and I2C address!");
+    Serial.println("# Error: BMA400 not connected, check wiring and I2C address!");
   }
 
   //Init Ultrasonic Sensor
   HCSR04.begin(ULTRASONIC_TRIGGER, ULTRASONIC_ECHO);
-  Serial.println("ms,T_C,RH,P_kPa,Gas_kOhm,Alt_m,Xg,Yg,Zg,vMic,vEMF,vLight,vAIN,US_mm");
+
+  // [CAL] Instructions and CSV header
+  Serial.println("# Commands: <distance mm> = collect 30 samples | w = warm-up log | s = stop | r <label> = run label | h = header");
+  printCsvHeader();
 }
 
 //loop function runs over and over again forever
 void loop() {
+  handleSerialCommands();  // [CAL] check for typed commands
   readSensors();
-  // printSensors();
+#if VERBOSE_PRINT
+  printSensors();
+#endif
   updateDisplay();
-  delay(800);
-  printCSV();
+  logCsvLine();            // [CAL] print one CSV line if logging is active
+  if (logMode == LOG_IDLE) {  // [CAL] one-line calibrated readout (ignored by cal_logger.py)
+    Serial.printf("# d_cal = %.1f mm | stock = %.1f mm | t = %ld us | c = %.2f m/s | T = %.2f C RH = %.1f %% P = %.3f kPa\n",
+                  SensorData.DistCal, SensorData.USDistance, SensorData.TofUs, SensorData.SoundSpeed,
+                  SensorData.T, SensorData.RH, SensorData.P);
+  }
+  delay(500);              // [CAL] was 800 ms; N_PINGS adds ~0.2 s per loop
 }
 
 void readSensors() {
   //Read BME and store in struct
   if (!bme.performReading()) {
-    Serial.println("Failed to perform reading :(");
+    Serial.println("# Failed to perform reading :(");
     return;
   }
-  SensorData.P = bme.pressure / 1000;
-  SensorData.G = bme.gas_resistance / 1000;
+  SensorData.P = bme.pressure / 1000.0;  // [CAL] was "/ 1000" (integer division truncated P to whole kPa)
+  SensorData.G = bme.gas_resistance / 1000.0;  // [CAL] same integer-division fix
   SensorData.Alt = bme.readAltitude(SEALEVELPRESSURE_HPA);
 
   //Check if AHT is connected and use it for Temp and Humidity, otherwise use BME680
@@ -164,8 +232,6 @@ void readSensors() {
     SensorData.T = bme.temperature;
     SensorData.RH = bme.humidity;
   }
-
- 
 
   //Read BME and store in struct
   accelerometer.getSensorData();
@@ -187,19 +253,22 @@ void readSensors() {
   SensorData.vAIN = ads.computeVolts(SensorData.AIN);
 
   //Ultrasonic
-  double *distances = HCSR04.measureDistanceMm();
-  SensorData.USDistance = distances[0];
+  // ORIGINAL:
+  // double *distances = HCSR04.measureDistanceMm();
+  // SensorData.USDistance = distances[0];
+  // [CAL] Measure the raw time of flight once, then compute the stock distance from it,
+  //       so tof_us and stock_mm in the CSV come from the SAME ping.
+  long tof = medianTofUs();                       // [CAL] median of N_PINGS raw times of flight
+  SensorData.TofUs = tof;
+  SensorData.USDistance = (tof > 0) ? tof * STOCK_SOS_MM_PER_US / 2.0 : -1;   // stock conversion (for comparison)
+  SensorData.SoundSpeed = speedOfSound(SensorData.T, SensorData.RH, SensorData.P);
+  SensorData.DistCal = (tof > 0) ? calibratedDistance(tof, SensorData.SoundSpeed) : -1;
 
   //Beep and flash LED to confirm sample taken
   digitalWrite(LED_PIN, HIGH);
-  // tone(BUZZER_PIN, 600, 15);
+  tone(BUZZER_PIN, 600, 15);
   delay(50);
   digitalWrite(LED_PIN, LOW);
-}
-
-void printCSV() {
-  Serial.printf("%.2f,%.2f,%.2f,%.0f\n",
-    SensorData.T, SensorData.RH, SensorData.P, SensorData.USDistance);
 }
 
 void printSensors() {
@@ -221,8 +290,141 @@ void printSensors() {
   Serial.printf("Light: %d (%f V)\n", SensorData.Light, SensorData.vLight);
   Serial.printf("AIN:   %d (%f V)\n", SensorData.AIN, SensorData.vAIN);
 
-  Serial.printf("US:    %f mm\n", SensorData.USDistance);
+  Serial.printf("US:    %f mm (stock)\n", SensorData.USDistance);
+  Serial.printf("Cal:   %f mm (c = %.2f m/s, t = %ld us)\n", SensorData.DistCal, SensorData.SoundSpeed, SensorData.TofUs);
 }
+
+// ===================== [CAL] Calibrated transfer function =====================
+
+// Speed of sound in humid air, O. Cramer, J. Acoust. Soc. Am. 93(5), 1993.
+// T in deg C, RH in %, P in kPa. Returns m/s.
+double speedOfSound(double t, double rh, double pKpa) {
+  double p = pKpa * 1000.0;                      // Pa
+  double T = t + 273.15;                         // K
+  double psv = exp(1.2378847e-5 * T * T - 1.9121316e-2 * T + 33.93711047 - 6.3431645e3 / T);  // saturation vapour pressure, Pa
+  double f = 1.00062 + 3.14e-8 * p + 5.6e-7 * t * t;                                        // enhancement factor
+  double xw = (rh / 100.0) * f * psv / p;                                                    // water-vapour mole fraction
+  double xc = CO2_FRACTION;
+  return 331.5024 + 0.603055 * t - 0.000528 * t * t
+         + (51.471935 + 0.1495874 * t - 0.000782 * t * t) * xw
+         + (-1.82e-7 + 3.73e-8 * t - 2.93e-10 * t * t) * p
+         + (-85.20931 - 0.228525 * t + 5.91e-5 * t * t) * xc
+         - 2.835149 * xw * xw - 2.15e-13 * p * p + 29.179762 * xc * xc + 4.86e-4 * xw * p * xc;
+}
+
+// Inverse transfer function: time of flight (us) and speed of sound (m/s) -> distance (mm)
+double calibratedDistance(long tofUs, double c) {
+  double dNominal = c * tofUs / 2000.0;          // m/s x us = um; /2 one-way; /1000 -> mm
+  return CAL_A * dNominal + CAL_B;               // [CAL] linear correction
+}
+
+// Median of N_PINGS time-of-flight readings; invalid pings (<= 0) are ignored
+long medianTofUs() {
+  long v[N_PINGS];
+  int k = 0;
+  for (int i = 0; i < N_PINGS; i++) {
+    long t = 0;
+    HCSR04.measureMicroseconds(&t);
+    if (t > 0) v[k++] = t;
+    delay(PING_GAP_MS);
+  }
+  if (k == 0) return -1;
+  for (int i = 1; i < k; i++) {                  // insertion sort (k <= 5)
+    long x = v[i];
+    int j = i - 1;
+    while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
+    v[j + 1] = x;
+  }
+  return v[k / 2];
+}
+
+// ===================== [CAL] Calibration logging functions =====================
+
+void printCsvHeader() {
+  Serial.println("time_ms,run,target_mm,n,tof_us,stock_mm,T_C,RH_pct,P_kPa");
+}
+
+// Read characters typed in the Serial Monitor; act on a full line when Enter is pressed
+void handleSerialCommands() {
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\n' || c == '\r') {
+      if (cmdBuf.length() > 0) processCommand(cmdBuf);
+      cmdBuf = "";
+    } else {
+      cmdBuf += c;
+    }
+  }
+}
+
+void processCommand(String cmd) {
+  cmd.trim();
+  if (cmd.length() == 0) return;
+
+  if (cmd.equalsIgnoreCase("s")) {
+    logMode = LOG_IDLE;
+    Serial.println("# stopped");
+    return;
+  }
+  if (cmd.equalsIgnoreCase("w")) {
+    logMode = LOG_WARMUP;
+    targetMm = -1;
+    samplesTaken = 0;
+    Serial.println("# warm-up logging started (type s to stop)");
+    return;
+  }
+  if (cmd.equalsIgnoreCase("h")) {
+    printCsvHeader();
+    return;
+  }
+  if (cmd.startsWith("r ") || cmd.startsWith("R ")) {
+    runLabel = cmd.substring(2);
+    runLabel.trim();
+    Serial.printf("# run label = %s\n", runLabel.c_str());
+    return;
+  }
+
+  float d = cmd.toFloat();  // anything else should be a distance in mm
+  if (d > 0) {
+    targetMm = d;
+    samplesTaken = 0;
+    logMode = LOG_COLLECT;
+    collectStartMs = millis() + SETTLE_MS;
+    Serial.printf("# target %.1f mm (run %s): collecting %d samples in %d s - step away from the beam\n",
+                  targetMm, runLabel.c_str(), SAMPLES_PER_POINT, SETTLE_MS / 1000);
+    return;
+  }
+
+  Serial.printf("# unknown command: %s\n", cmd.c_str());
+}
+
+// Print one CSV line for the most recent sample, if logging is active
+void logCsvLine() {
+  if (logMode == LOG_IDLE) return;
+  if (logMode == LOG_COLLECT && millis() < collectStartMs) return;  // still settling
+
+  samplesTaken++;
+  Serial.printf("%lu,%s,%.1f,%d,%ld,%.2f,%.2f,%.2f,%.3f\n",
+                millis(), runLabel.c_str(), targetMm, samplesTaken,
+                SensorData.TofUs, SensorData.USDistance,
+                SensorData.T, SensorData.RH, SensorData.P);
+
+  if (logMode == LOG_COLLECT && samplesTaken >= SAMPLES_PER_POINT) {
+    logMode = LOG_IDLE;
+    Serial.printf("# done: %.1f mm - move the target to the next position\n", targetMm);
+    doneBeep();
+  }
+}
+
+// Two short high beeps = block finished
+void doneBeep() {
+  tone(BUZZER_PIN, 1500, 120);
+  delay(200);
+  tone(BUZZER_PIN, 1500, 120);
+  delay(200);
+}
+
+// ===============================================================================
 
 void updateDisplay() {
   char tempStringSorage[128] = { 0 };  //Used as a place for store strings that we created before sending to display buffer
@@ -247,13 +449,6 @@ void updateDisplay() {
   tft.drawFastHLine(0, 99, COLLUMN_TWO_X - 10, ST77XX_YELLOW);
 
   //------Write All Text to Screen------
-
-  /* GENERAL PATTERN
-  tft.setCursor(x,y); //Set the virtual cursor to a place on the screen
-  memset(tempStringSorage, 0, sizeof(tempStringSorage)); //Reset temp string storage so there is no overlap
-  sprintf(tempStringSorage, "P: %3.1f kPa\n", SensorData.P); //Create a string basted on standard 'C string format specifiers'
-  tft.print(tempStringSorage); //Print String to screen, this will handle drawing the slected font, in the selected colour, and moving the cursor for each character
-  */
 
   //Write AHT20/BME Values to Screen
   tft.setCursor(COLLUMN_ONE_X, 14);
@@ -292,11 +487,11 @@ void updateDisplay() {
   //USS to Screen
   tft.setCursor(COLLUMN_ONE_X, 113);
   tft.setTextColor(TITLE_COLOUR);
-  tft.print("Ultrasonic\n");
+  tft.print("Range (cal)\n");  // [CAL]
   tft.setTextColor(VALUE_COLOUR);
   tft.setCursor(COLLUMN_ONE_X, 128);
   memset(tempStringSorage, 0, sizeof(tempStringSorage));
-  sprintf(tempStringSorage, "%5.0f mm\n", SensorData.USDistance);
+  sprintf(tempStringSorage, "%6.1f mm\n", SensorData.DistCal);  // [CAL] calibrated distance
   tft.print(tempStringSorage);
 
   //Write BMA400 Values to Screen
@@ -339,4 +534,3 @@ void updateDisplay() {
   sprintf(tempStringSorage, "A: %2.3fV\n", SensorData.vAIN);
   tft.print(tempStringSorage);
 }
-
